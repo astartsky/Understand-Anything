@@ -52,7 +52,7 @@ If the manifest is missing or malformed, leave the corresponding field empty rat
 
 ### Step B (bundled `scan-project.mjs`) -- File enumeration + language + category + lines
 
-Invoke the bundled scan script. It walks the project (preferring `git ls-files`, falling back to a recursive walk for non-git directories), applies `.understandignore` filtering (defaults + user patterns), assigns `language` and `fileCategory` per the canonical tables, counts lines, and writes deterministic JSON. You do not see or maintain those tables — they live in the script.
+Invoke the bundled scan script with `--exclude-analysis-data` so its graph, context and intermediate artifacts cannot become source input. It walks the project (preferring `git ls-files`, falling back to a recursive walk for non-git directories), applies `.understandignore` filtering (defaults + user patterns), assigns `language` and `fileCategory` per the canonical tables, counts lines, and writes deterministic JSON. You do not see or maintain those tables — they live in the script.
 
 If the dispatch prompt includes exclude patterns, append `--exclude "<patterns>"` to the invocation (patterns should be comma-separated; the script splits them internally).
 
@@ -60,18 +60,18 @@ Resolve the project's data directory once (the legacy `.understand-anything/` wh
 
 ```bash
 UA_DIR="$PROJECT_ROOT/$([ -d "$PROJECT_ROOT/.understand-anything" ] && echo .understand-anything || echo .ua)"
-mkdir -p $UA_DIR/tmp
-node $PLUGIN_ROOT/skills/understand/scan-project.mjs \
+mkdir -p "$UA_DIR/tmp"
+node "$PLUGIN_ROOT/skills/understand/scan-project.mjs" \
   "$PROJECT_ROOT" \
-  "$UA_DIR/tmp/ua-scan-files.json"
+  "$UA_DIR/tmp/ua-scan-files.json" --exclude-analysis-data
 ```
 
 With exclude patterns (add the `--exclude` flag after the output path):
 
 ```bash
-node $PLUGIN_ROOT/skills/understand/scan-project.mjs \
+node "$PLUGIN_ROOT/skills/understand/scan-project.mjs" \
   "$PROJECT_ROOT" \
-  "$UA_DIR/tmp/ua-scan-files.json" \
+  "$UA_DIR/tmp/ua-scan-files.json" --exclude-analysis-data \
   --exclude "tests/*,docs/*"
 ```
 
@@ -135,8 +135,8 @@ Write the input JSON for the bundled script (the `files[]` array is exactly Step
 
 ```bash
 UA_DIR="$PROJECT_ROOT/$([ -d "$PROJECT_ROOT/.understand-anything" ] && echo .understand-anything || echo .ua)"
-mkdir -p $UA_DIR/tmp
-cat > $UA_DIR/tmp/ua-import-map-input.json << 'ENDJSON'
+mkdir -p "$UA_DIR/tmp"
+cat > "$UA_DIR/tmp/ua-import-map-input.json" << 'ENDJSON'
 {
   "projectRoot": "<absolute-project-root>",
   "files": [
@@ -150,9 +150,9 @@ ENDJSON
 Then run:
 
 ```bash
-node $PLUGIN_ROOT/skills/understand/extract-import-map.mjs \
-  $UA_DIR/tmp/ua-import-map-input.json \
-  $UA_DIR/tmp/ua-import-map-output.json
+node "$PLUGIN_ROOT/skills/understand/extract-import-map.mjs" \
+  "$UA_DIR/tmp/ua-import-map-input.json" \
+  "$UA_DIR/tmp/ua-import-map-output.json"
 ```
 
 The output JSON has shape:
@@ -243,7 +243,7 @@ Then assemble the final output JSON:
 
 After producing the final JSON:
 
-1. Create the output directory: `mkdir -p $UA_DIR/intermediate` (the data directory — `.ua/`, or the legacy `.understand-anything/` when present)
+1. Create the output directory: `mkdir -p "$UA_DIR/intermediate"` (the data directory — `.ua/`, or the legacy `.understand-anything/` when present)
 2. Write the JSON to: `$UA_DIR/intermediate/scan-result.json`. Use the exact output path given in your dispatch prompt if one was provided.
 3. Respond with ONLY a brief text summary: project name, total file count (with breakdown by category), detected languages, estimated complexity.
 

@@ -1,3 +1,4 @@
+import { graphResponseHash, validateDiffOverlay } from "./diff-overlay";
 import { useEffect, useState, useMemo, useCallback, lazy, Suspense } from "react";
 import { validateGraph } from "@understand-anything/core/schema";
 import type { GraphIssue } from "@understand-anything/core/schema";
@@ -119,6 +120,7 @@ function Dashboard({ accessToken }: { accessToken: string }) {
   const setGraph = useDashboardStore((s) => s.setGraph);
   const setDomainGraph = useDashboardStore((s) => s.setDomainGraph);
   const setDiffOverlay = useDashboardStore((s) => s.setDiffOverlay);
+  const clearDiffOverlay = useDashboardStore((s) => s.clearDiffOverlay);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [graphIssues, setGraphIssues] = useState<GraphIssue[]>([]);
   const [graphFreshness, setGraphFreshness] =
@@ -142,56 +144,63 @@ function Dashboard({ accessToken }: { accessToken: string }) {
   }, []);
 
   useEffect(() => {
-    fetch(dataUrl("knowledge-graph.json", accessToken))
-      .then(async (res) => {
-        // Guard res.ok before parsing (matching the meta.json/config.json/
-        // diff-overlay.json/domain-graph.json fetches in this file). Without
-        // this, a serving/config failure returns a 404 JSON error body that
-        // gets parsed and handed to validateGraph, which fails project-metadata
-        // validation and surfaces the misleading "Invalid knowledge graph:
-        // Missing or invalid project metadata" instead of the real cause
-        // (graph file not found / GRAPH_DIR unset). See issues #288, #406.
-        if (!res.ok) {
-          let detail = `HTTP ${res.status}`;
-          try {
-            const body = await res.json();
-            if (body?.error) detail = body.error;
-          } catch {
-            /* non-JSON error body; keep the status code */
-          }
-          throw new Error(detail);
-        }
-        return res.json();
-      })
-      .then((data: unknown) => {
+    let disposed = false;
+    clearDiffOverlay();
+    const load = async () => {
+      const [knowledgeResponse, domainResponse] = await Promise.all([
+        fetch(dataUrl("knowledge-graph.json", accessToken)),
+        fetch(dataUrl("domain-graph.json", accessToken)).catch(() => null),
+      ]);
+      const hasKnowledge = knowledgeResponse.status !== 404;
+      if (hasKnowledge) {
+        if (!knowledgeResponse.ok) throw new Error(`Knowledge graph: HTTP ${knowledgeResponse.status}`);
+        const body = await knowledgeResponse.text();
+        const contentHash = await graphResponseHash(knowledgeResponse, body);
+        const data: unknown = JSON.parse(body);
         const result = validateGraph(data);
-        if (result.success && result.data) {
-          setGraph(result.data);
-          setGraphIssues(result.issues);
-          if ((data as Record<string, unknown>).kind === "knowledge") {
-            useDashboardStore.getState().setViewMode("knowledge");
-            useDashboardStore.getState().setIsKnowledgeGraph(true);
-          }
-          for (const issue of result.issues) {
-            if (issue.level === "auto-corrected") {
-              console.warn(`[graph] auto-corrected: ${issue.message}`);
-            } else if (issue.level === "dropped") {
-              console.error(`[graph] dropped: ${issue.message}`);
-            }
-          }
-        } else if (result.fatal) {
-          console.error("Knowledge graph validation failed:", result.fatal);
-          setLoadError(`Invalid knowledge graph: ${result.fatal}`);
-        } else {
-          console.error("Knowledge graph validation failed: unknown error");
-          setLoadError("Invalid knowledge graph: unknown validation error");
+        if (!result.success || !result.data) throw new Error(`Invalid knowledge graph: ${result.fatal ?? "validation failed"}`);
+        if (disposed) return;
+        setGraph(result.data, contentHash);
+        setGraphIssues(result.issues);
+        if ((data as Record<string, unknown>).kind === "knowledge") {
+          useDashboardStore.getState().setViewMode("knowledge");
+          useDashboardStore.getState().setIsKnowledgeGraph(true);
         }
-      })
-      .catch((err) => {
-        console.error("Failed to load knowledge graph:", err);
-        setLoadError(`Failed to load knowledge graph: ${err instanceof Error ? err.message : String(err)}`);
-      });
-  }, [setGraph]);
+        try {
+          const response = await fetch(dataUrl("diff-overlay.json", accessToken), { cache: "no-store" });
+          const overlay = response.ok
+            ? validateDiffOverlay(await response.json(), contentHash, result.data.nodes)
+            : null;
+          if (disposed) return;
+          if (overlay) setDiffOverlay(overlay.changedNodeIds, overlay.affectedNodeIds, overlay);
+          else clearDiffOverlay();
+        } catch {
+          if (!disposed) clearDiffOverlay();
+        }
+      }
+      // Load in a fixed order: an optional domain graph must not race the code view.
+      if (domainResponse?.ok) {
+        try {
+          const result = validateGraph(await domainResponse.json());
+          if (!result.success || !result.data) throw new Error(`Invalid domain graph: ${result.fatal ?? "validation failed"}`);
+          if (disposed) return;
+          setDomainGraph(result.data);
+          if (!hasKnowledge) setGraphIssues(result.issues);
+        } catch (error) {
+          if (!hasKnowledge) throw error;
+          console.warn("Failed to load optional domain graph:", error);
+        }
+      } else if (!hasKnowledge) {
+        throw new Error(domainResponse?.status === 404
+          ? "No knowledge or domain graph found. Run /understand or /understand-domain first."
+          : `Domain graph: ${domainResponse ? `HTTP ${domainResponse.status}` : "request failed"}`);
+      }
+    };
+    void load().catch((error: unknown) => {
+      if (!disposed) setLoadError(error instanceof Error ? error.message : String(error));
+    });
+    return () => { disposed = true; };
+  }, [setGraph, setDomainGraph, setDiffOverlay, clearDiffOverlay, accessToken]);
 
   useEffect(() => {
     if (
@@ -214,48 +223,6 @@ function Dashboard({ accessToken }: { accessToken: string }) {
       onResult: setGraphFreshness,
     });
   }, [accessToken]);
-
-  useEffect(() => {
-    fetch(dataUrl("diff-overlay.json", accessToken))
-      .then((res) => {
-        if (!res.ok) return null;
-        return res.json();
-      })
-      .then((data: unknown) => {
-        if (
-          data &&
-          typeof data === "object" &&
-          "changedNodeIds" in data &&
-          "affectedNodeIds" in data &&
-          Array.isArray((data as Record<string, unknown>).changedNodeIds) &&
-          Array.isArray((data as Record<string, unknown>).affectedNodeIds)
-        ) {
-          const d = data as { changedNodeIds: string[]; affectedNodeIds: string[] };
-          if (d.changedNodeIds.length > 0) {
-            setDiffOverlay(d.changedNodeIds, d.affectedNodeIds);
-          }
-        }
-      })
-      .catch(() => {});
-  }, [setDiffOverlay]);
-
-  useEffect(() => {
-    fetch(dataUrl("domain-graph.json", accessToken))
-      .then((res) => {
-        if (!res.ok) return null;
-        return res.json();
-      })
-      .then((data: unknown) => {
-        if (!data) return;
-        const result = validateGraph(data);
-        if (result.success && result.data) {
-          setDomainGraph(result.data);
-        } else if (result.fatal) {
-          console.warn(`[domain-graph] validation failed: ${result.fatal}`);
-        }
-      })
-      .catch(() => {});
-  }, [setDomainGraph]);
 
   return (
     <I18nProvider language={outputLanguage ?? "en"}>
@@ -502,7 +469,7 @@ function DashboardContent({
         {/* Left — fixed */}
         <div className="flex items-center gap-3 sm:gap-5 shrink-0 min-w-0">
           <h1 className="font-heading text-base sm:text-lg text-text-primary tracking-wide truncate max-w-[160px] sm:max-w-[220px] lg:max-w-none">
-            {graph?.project.name ?? t.common.appName}
+            {graph?.project.name ?? domainGraph?.project.name ?? t.common.appName}
           </h1>
           <div className="w-px h-5 bg-border-subtle hidden sm:block" />
           <PersonaSelector />

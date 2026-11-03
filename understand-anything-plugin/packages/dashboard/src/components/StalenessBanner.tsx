@@ -101,12 +101,15 @@ export function buildFreshnessBanner(
   freshness: DashboardFreshnessReport | null,
 ): FreshnessBannerContent | null {
   if (!freshness) return null;
-  const entries: GraphEntry[] = [
-    { name: "knowledge", result: freshness.graphs.knowledge },
-  ];
+  const entries: GraphEntry[] = [];
+  if (freshness.graphs.knowledge) {
+    entries.push({ name: "knowledge", result: freshness.graphs.knowledge });
+  }
   if (freshness.graphs.domain) {
     entries.push({ name: "domain", result: freshness.graphs.domain });
   }
+
+  if (entries.length === 0) return null;
 
   const highestRisk = Math.max(
     ...entries.map((entry) => RISK_RANK[entry.result.status]),

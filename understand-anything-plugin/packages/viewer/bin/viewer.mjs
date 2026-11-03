@@ -7,8 +7,8 @@
  *     understand-anything-viewer [project-dir] [--port <n>] [--no-open]
  *
  * The project directory (default: cwd) must contain a data directory —
- * `.ua/` or legacy `.understand-anything/` — with a knowledge-graph.json
- * produced by /understand.
+ * `.ua/` or legacy `.understand-anything/` — with knowledge-graph.json
+ * or domain-graph.json produced by /understand or /understand-domain.
  *
  * Security model mirrors the dashboard dev server (vite.config.ts):
  *   - binds to 127.0.0.1 only
@@ -27,10 +27,6 @@ import { getGraphFreshnessBatch } from "./dist/staleness.js";
 
 const DIST_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
 const MAX_SOURCE_FILE_BYTES = 1024 * 1024;
-// Legacy directory first — projects analyzed before the `.ua` rename keep
-// their existing `.understand-anything/` data.
-const UA_DIR_CANDIDATES = [".understand-anything", ".ua"];
-
 // ── CLI args ───────────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
@@ -70,15 +66,15 @@ if (!fs.existsSync(DIST_DIR)) {
   process.exit(1);
 }
 
-const graphDir = UA_DIR_CANDIDATES
-  .map((d) => path.join(projectRoot, d))
-  .find((d) => fs.existsSync(path.join(d, "knowledge-graph.json")));
+// Select one data directory for every endpoint; never mix .ua and legacy files.
+const graphDir = path.join(projectRoot,
+  fs.existsSync(path.join(projectRoot, ".understand-anything")) ? ".understand-anything" : ".ua",
+);
 
-if (!graphDir) {
+if (!["knowledge-graph.json", "domain-graph.json"].some((file) => fs.existsSync(path.join(graphDir, file)))) {
   console.error(
-    `Error: no knowledge graph found under ${projectRoot}\n` +
-    "Expected .ua/knowledge-graph.json (or legacy .understand-anything/). " +
-    "Generate one with /understand first, or pass the project directory as an argument.",
+    `Error: no knowledge or domain graph found under ${graphDir}\n` +
+    "Generate one with /understand or /understand-domain first, or pass the project directory as an argument.",
   );
   process.exit(1);
 }
@@ -116,15 +112,18 @@ function normalizeGraphPath(filePath) {
 
 function graphFilePathSet() {
   const allowed = new Set();
-  try {
-    const raw = JSON.parse(fs.readFileSync(path.join(graphDir, "knowledge-graph.json"), "utf-8"));
-    for (const node of raw.nodes ?? []) {
-      if (typeof node.filePath !== "string") continue;
-      const normalized = normalizeGraphPath(node.filePath);
-      if (normalized) allowed.add(normalized);
+  for (const file of ["knowledge-graph.json", "domain-graph.json"]) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(graphDir, file), "utf-8"));
+      if (!Array.isArray(raw?.nodes)) continue;
+      for (const node of raw.nodes) {
+        if (!node || typeof node.filePath !== "string") continue;
+        const normalized = normalizeGraphPath(node.filePath);
+        if (normalized) allowed.add(normalized);
+      }
+    } catch {
+      // A missing or unreadable graph grants no paths; the other graph is independent.
     }
-  } catch {
-    return allowed;
   }
   return allowed;
 }
@@ -170,19 +169,26 @@ function readSourceFile(url) {
   }
   const safeRelativePath = relativeToRoot.split(path.sep).join("/");
   if (!graphFilePathSet().has(safeRelativePath)) {
-    return reject("File is not in the knowledge graph", 404);
+    return reject("File is not in the selected graphs", 404);
   }
 
   let stat;
+  let physicalFile;
   try {
-    stat = fs.statSync(absoluteFile);
+    physicalFile = fs.realpathSync(absoluteFile);
+    const physicalRoot = fs.realpathSync(projectRoot);
+    const physicalRelative = path.relative(physicalRoot, physicalFile);
+    if (!physicalRelative || physicalRelative === ".." || physicalRelative.startsWith(`..${path.sep}`) || path.isAbsolute(physicalRelative)) {
+      return reject("Path must stay inside the project");
+    }
+    stat = fs.statSync(physicalFile);
   } catch {
     return reject("File not found", 404);
   }
   if (!stat.isFile()) return reject("Path is not a file");
   if (stat.size > MAX_SOURCE_FILE_BYTES) return reject("File is too large to preview", 413);
 
-  const buffer = fs.readFileSync(absoluteFile);
+  const buffer = fs.readFileSync(physicalFile);
   if (buffer.includes(0)) return reject("Binary files cannot be previewed", 415);
 
   const content = buffer.toString("utf8");
@@ -202,7 +208,21 @@ function serveGraphJson(res, fileName) {
   const candidate = path.join(graphDir, fileName);
   if (fs.existsSync(candidate)) {
     try {
-      const raw = JSON.parse(fs.readFileSync(candidate, "utf-8"));
+      const bytes = fs.readFileSync(candidate);
+      const raw = JSON.parse(bytes.toString("utf8"));
+      res.setHeader("Cache-Control", "no-store");
+      if (fileName === "knowledge-graph.json") {
+        res.setHeader("X-Understand-Graph-Hash", crypto.createHash("sha256").update(bytes).digest("hex"));
+      }
+      if (fileName === "diff-overlay.json") {
+        const graphPath = path.join(graphDir, "knowledge-graph.json");
+        const graphHash = fs.existsSync(graphPath)
+          ? crypto.createHash("sha256").update(fs.readFileSync(graphPath)).digest("hex") : null;
+        if (!graphHash || raw.graphContentHash !== graphHash) {
+          sendJson(res, 409, { error: "Diff snapshot does not match the served knowledge graph. Regenerate /understand-diff." });
+          return;
+        }
+      }
       // Sanitise absolute node filePaths so the developer's directory
       // layout is never sent to the browser.
       if (Array.isArray(raw.nodes)) {
@@ -248,28 +268,16 @@ function readGraphMetadata(fileName) {
 }
 
 async function readGraphFreshness() {
-  const knowledgeGraph = path.join(graphDir, "knowledge-graph.json");
-  if (!fs.existsSync(knowledgeGraph)) {
-    return {
-      statusCode: 404,
-      payload: { error: "No knowledge graph found. Run /understand first." },
-    };
-  }
-
-  const domainGraph = path.join(graphDir, "domain-graph.json");
-  let inputs;
+  const inputs = {};
   try {
-    inputs = {
-      knowledge: readGraphMetadata("knowledge-graph.json"),
-      ...(fs.existsSync(domainGraph)
-        ? { domain: readGraphMetadata("domain-graph.json") }
-        : {}),
-    };
+    for (const [name, file] of [["knowledge", "knowledge-graph.json"], ["domain", "domain-graph.json"]]) {
+      if (fs.existsSync(path.join(graphDir, file))) inputs[name] = readGraphMetadata(file);
+    }
   } catch {
-    return {
-      statusCode: 500,
-      payload: { error: "Failed to read graph file" },
-    };
+    return { statusCode: 500, payload: { error: "Failed to read graph file" } };
+  }
+  if (Object.keys(inputs).length === 0) {
+    return { statusCode: 404, payload: { error: "No knowledge or domain graph found. Run /understand or /understand-domain first." } };
   }
 
   return {

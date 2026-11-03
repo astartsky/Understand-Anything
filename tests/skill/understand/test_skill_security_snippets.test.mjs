@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -8,6 +10,12 @@ const repoRoot = resolve(__dirname, '../../..');
 
 function readRepoFile(relPath) {
   return readFileSync(resolve(repoRoot, relPath), 'utf-8');
+}
+
+function readSkillWithReferences(relPath) {
+  const entry = readRepoFile(relPath);
+  const refs = [...new Set([...entry.matchAll(/\]\((references\/[^)]+\.md)\)/g)].map(match => match[1]))];
+  return [entry, ...refs.map(ref => readFileSync(resolve(repoRoot, dirname(relPath), ref), 'utf-8'))].join('\n');
 }
 
 describe('skill command hardening', () => {
@@ -25,7 +33,7 @@ describe('skill command hardening', () => {
     ];
 
     for (const relPath of files) {
-      const content = readRepoFile(relPath);
+      const content = readSkillWithReferences(relPath);
       for (const pattern of unsafePatterns) {
         expect(content, `${relPath} should not contain ${pattern}`).not.toMatch(pattern);
       }
@@ -49,28 +57,50 @@ describe('skill command hardening', () => {
     expect(content).toContain('Never update `meta.json` for a generated-artifact-only commit');
   });
 
-  it('quotes dashboard cd targets and GRAPH_DIR assignment', () => {
+  it('runs the documented local viewer with a literal spaced project path', () => {
     const content = readRepoFile('understand-anything-plugin/skills/understand-dashboard/SKILL.md');
+    const blocks = [...content.matchAll(/```bash\n([\s\S]*?)```/g)].map(match => match[1]);
+    const launches = blocks.filter(block => block.includes('VIEWER_DIR='));
+    expect(launches).toHaveLength(1);
+    const block = launches[0];
+    expect(block).not.toMatch(/\bnpx\b|\b(?:npm|pnpm)\s+install\b/);
+    const dir = mkdtempSync(resolve(tmpdir(), 'ua-launch-'));
+    try {
+      const project = resolve(dir, 'project with spaces');
+      const plugin = resolve(dir, 'plugin with spaces');
+      const viewer = resolve(plugin, 'packages/viewer');
+      mkdirSync(project);
+      mkdirSync(resolve(viewer, 'bin/dist'), { recursive: true });
+      mkdirSync(resolve(viewer, 'dist'));
+      writeFileSync(resolve(viewer, 'dist/index.html'), 'fixture');
+      writeFileSync(resolve(viewer, 'bin/dist/staleness.js'), '');
+      writeFileSync(resolve(viewer, 'bin/viewer.mjs'), 'console.log(JSON.stringify(process.argv.slice(2)));');
+      const result = spawnSync('bash', ['--noprofile', '--norc', '-c', block], {
+        cwd: dir, encoding: 'utf8',
+        env: { PATH: process.env.PATH, PROJECT_ROOT: project, PLUGIN_ROOT: plugin },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual([project, '--no-open']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 
-    expect(content).not.toMatch(/<(?:dashboard-dir|plugin-root|project-dir)>/);
-    expect(content).not.toMatch(/\bcd <(?:dashboard-dir|plugin-root)>/);
-    expect(content).not.toMatch(/GRAPH_DIR=<project-dir>/);
-    expect(content).toMatch(/PROJECT_DIR=\$\(pwd -P\)/);
-    expect(content).toMatch(/UA_DIR="\$PROJECT_DIR\/\.understand-anything"/);
-    expect(content).toMatch(/\[ ! -f "\$UA_DIR\/knowledge-graph\.json" \]/);
-    expect(content).toMatch(/DASHBOARD_DIR="\$PLUGIN_ROOT\/packages\/dashboard"/);
-    expect(content).toMatch(/: "\$\{PLUGIN_ROOT:\?Run step 3 first so PLUGIN_ROOT is set\}"/);
-    expect(content).toMatch(/: "\$\{PROJECT_DIR:\?Run step 1 first so PROJECT_DIR is set\}"/);
-    expect(content).toMatch(/: "\$\{DASHBOARD_DIR:\?Run step 5 first so DASHBOARD_DIR is set\}"/);
-    expect(content).toMatch(/cd "\$PLUGIN_ROOT" && pnpm --filter @understand-anything\/core build/);
-    expect(content).toMatch(/cd "\$DASHBOARD_DIR" && GRAPH_DIR="\$PROJECT_DIR" npx vite/);
-    // Fast path: the viewer URL is version-pinned and both npx arguments are quoted.
-    expect(content).toMatch(/VIEWER_URL="https:\/\/github\.com\/Egonex-AI\/Understand-Anything\/releases\/download\/v\$\{PLUGIN_VERSION\}\/understand-anything-viewer\.tgz"/);
-    expect(content).toMatch(/npx --yes "\$VIEWER_URL" "\$PROJECT_DIR"/);
+  it('writes the actual project-scanner import input through a spaced checkout path', () => {
+    const content = readRepoFile('understand-anything-plugin/agents/project-scanner.md');
+    const blocks = [...content.matchAll(/```bash\n([\s\S]*?)```/g)].map(match => match[1]);
+    const writes = blocks.filter(block => block.includes('cat >') && block.includes('ua-import-map-input.json'));
+    expect(writes).toHaveLength(1);
+    const project = mkdtempSync(resolve(tmpdir(), 'feature checkout '));
+    try {
+      const result = spawnSync('bash', ['--noprofile', '--norc', '-c', writes[0]], {
+        encoding: 'utf8', env: { PATH: process.env.PATH, PROJECT_ROOT: project },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(readFileSync(resolve(project, '.ua/tmp/ua-import-map-input.json'), 'utf8')).files).toHaveLength(2);
+    } finally { rmSync(project, { recursive: true, force: true }); }
   });
 
   it('marks project-controlled context as untrusted data', () => {
-    const understand = readRepoFile('understand-anything-plugin/skills/understand/SKILL.md');
+    const understand = readSkillWithReferences('understand-anything-plugin/skills/understand/SKILL.md');
     const knowledge = readRepoFile('understand-anything-plugin/skills/understand-knowledge/SKILL.md');
 
     expect(understand).not.toMatch(/README and manifest are authoritative/i);

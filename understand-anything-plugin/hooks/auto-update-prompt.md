@@ -6,16 +6,17 @@ Incrementally update the knowledge graph after a commit. Do not ask the user for
 
 ## Phase 0 — Pre-flight and deterministic preparation
 
-1. Set `PROJECT_ROOT` to the current working directory. Resolve the data directory once:
+1. Resolve `$PLUGIN_ROOT` from `$CLAUDE_PLUGIN_ROOT`, then `$HOME/.understand-anything-plugin`. Require both `skills/understand/analysis-context.mjs` and `prepare-incremental.mjs`; stop on a missing runtime without installing or building dependencies.
+2. Resolve `PROJECT_ROOT` to the current Git checkout root with `git rev-parse --show-toplevel`. Never redirect it to the common/main worktree. Run the read-only source/baseline preflight:
 
    ```bash
-   UA_DIR="$PROJECT_ROOT/$([ -d "$PROJECT_ROOT/.understand-anything" ] && echo .understand-anything || echo .ua)"
+   node "$PLUGIN_ROOT/skills/understand/analysis-context.mjs" context "$PROJECT_ROOT"
    ```
 
-2. Require `$UA_DIR/knowledge-graph.json` and `$UA_DIR/meta.json`. If either is missing, report that `/understand` must create a baseline and **STOP**.
-3. Read `gitCommitHash` from meta as `$LAST_COMMIT_HASH`; get `$HEAD_COMMIT` with `git rev-parse HEAD`. If they match, report that the graph is current and **STOP**.
-4. Resolve `$PLUGIN_ROOT` from `$CLAUDE_PLUGIN_ROOT`, then `$HOME/.understand-anything-plugin`, validating that it contains `skills/understand/prepare-incremental.mjs`. If it cannot be found, report the error and **STOP** without changing metadata.
-5. Ensure core is built, then run the bundled helper with parameterized arguments:
+   Stop on non-zero exit. Read `sourceRoot`, `uaDir`, `gitCommitHash`, and `lastCommitHash` from that result as `$PROJECT_ROOT`, `$UA_DIR`, `$HEAD_COMMIT`, and `$LAST_COMMIT_HASH`. Carry the absolute paths into every later shell.
+3. Inspect `baselineAction` before comparing commits. `FULL` means the graph is missing, copied, unbound, dirty, or inconsistent: invoke `/understand --full` for this exact source directory instead of reusing the incremental baseline. Preserve the old graph until the full run validates successfully. `CURRENT` means no update is needed; report that and stop.
+4. Continue only for `INCREMENTAL`. The context check validates graph, metadata and fingerprints together; a matching HEAD alone is insufficient evidence of freshness. Hook triggering still depends on a commit change and does not detect all same-HEAD edits automatically.
+5. Run the bundled preparation helper with parameterized arguments:
 
    ```bash
    node "$PLUGIN_ROOT/skills/understand/prepare-incremental.mjs" \

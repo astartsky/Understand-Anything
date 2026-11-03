@@ -58,6 +58,40 @@ const validGraph: KnowledgeGraph = {
 };
 
 describe("schema validation", () => {
+  it("preserves selected-source binding when validating for downstream consumers", () => {
+    const graph = structuredClone(validGraph);
+    Object.assign(graph.project, {
+      sourceRoot: "/project/feature-worktree",
+      workingTreeDirty: true,
+      scanId: "scan-content-hash",
+    });
+    const result = validateGraph(graph);
+    expect(result.success).toBe(true);
+    expect(result.data!.project).toMatchObject({
+      sourceRoot: "/project/feature-worktree",
+      workingTreeDirty: true,
+      scanId: "scan-content-hash",
+    });
+  });
+
+  it("preserves edge evidence through the dashboard validation boundary", () => {
+    const graph = structuredClone(validGraph);
+    const evidence = {
+      extraction: "llm-inference",
+      provenance: [{ articleId: "article:source", quote: "A cited statement." }],
+    };
+    Object.assign(graph.edges[0], { knowledgeMeta: evidence });
+    const result = validateGraph(graph);
+    expect(result.success).toBe(true);
+    expect(result.data!.edges[0]).toMatchObject({ knowledgeMeta: evidence });
+  });
+
+  it("rejects malformed source-binding flags instead of silently removing them", () => {
+    const graph = structuredClone(validGraph);
+    Object.assign(graph.project, { workingTreeDirty: "false" });
+    expect(validateGraph(graph).success).toBe(false);
+  });
+
   it("validates a correct knowledge graph", () => {
     const result = validateGraph(validGraph);
     expect(result.success).toBe(true);

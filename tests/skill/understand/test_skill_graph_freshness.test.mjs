@@ -1,71 +1,68 @@
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { afterEach, describe, expect, it } from 'vitest';
+import { assertSourceCommit } from '../../../understand-anything-plugin/skills/understand/analysis-context.mjs';
+import { prepareContext } from '../../../understand-anything-plugin/skills/understand-domain/domain-context.mjs';
+import { dashboardContext } from '../../../understand-anything-plugin/skills/understand-dashboard/dashboard-context.mjs';
+import { collectContext } from '../../../understand-anything-plugin/skills/understand-diff/diff-context.mjs';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(__dirname, "../../..");
+const fixtures = [];
+afterEach(() => { for (const root of fixtures.splice(0)) rmSync(root, { recursive: true, force: true }); });
+function fixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'ua-freshness-consumer-')));
+  fixtures.push(root);
+  const git = (...args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8' }).trim();
+  git('init', '-q');
+  writeFileSync(join(root, '.gitignore'), '.ua/\n.understand-anything/\n');
+  writeFileSync(join(root, 'orders.ts'), 'export const orders = 1;\n');
+  git('add', '.');
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'baseline');
+  const hash = git('rev-parse', 'HEAD');
+  const project = { sourceRoot: root, gitCommitHash: hash, workingTreeDirty: false };
+  mkdirSync(join(root, '.ua'));
+  writeFileSync(join(root, '.ua', 'knowledge-graph.json'), JSON.stringify({
+    project, nodes: [{ id: 'orders', name: 'Orders', type: 'service', filePath: 'orders.ts' }], edges: [], layers: [],
+  }));
+  writeFileSync(join(root, '.ua', 'meta.json'), JSON.stringify(project));
+  writeFileSync(join(root, '.ua', 'fingerprints.json'), JSON.stringify({ gitCommitHash: hash }));
+  return { root, hash };
+}
 
-const graphConsumerSkills = [
-  "understand-chat",
-  "understand-explain",
-  "understand-diff",
-  "understand-onboard",
-  "understand-domain",
-];
+describe('graph freshness consumers use read-only Git inspection', () => {
+  const readers = [
+    ['analysis preflight', ({ root, hash }) => assertSourceCommit(root, hash)],
+    ['domain preflight', ({ root }) => prepareContext([root])],
+    ['dashboard preflight', ({ root }) => dashboardContext(root)],
+    ['diff collection', ({ root }) => collectContext({ sourceRoot: root })],
+  ];
+  it.each(readers)('%s preserves the Git index even when stat data needs refresh', (_, inspect) => {
+    const f = fixture();
+    const index = join(f.root, '.git', 'index');
+    const before = readFileSync(index);
+    // Same bytes, stale filesystem timestamps: ordinary git status/diff refresh the index.
+    utimesSync(join(f.root, 'orders.ts'), 1234567890, 1234567890);
+    inspect(f);
+    expect(readFileSync(index)).toEqual(before);
+    expect(readFileSync(join(f.root, 'orders.ts'), 'utf8')).toBe('export const orders = 1;\n');
+  });
 
-const requiredFreshnessInstructions = [
-  "gitCommitHash",
-  "git rev-parse HEAD",
-  'git rev-parse --verify --end-of-options "${GRAPH_COMMIT_RAW}^{commit}"',
-  "git diff --name-only \"$GRAPH_COMMIT\" HEAD -- .",
-  "git diff --cached --name-only -- .",
-  "git diff --name-only -- .",
-  "git ls-files --others --exclude-standard -- .",
-  "working-tree",
-  "hash mismatch",
-  "project diff is empty",
-  "Ignore the selected data directory (`.ua/` or legacy `.understand-anything/`)",
-  "warn",
-  "continue",
-  "Run `/understand`",
-];
+  it('domain regenerates stale or dirty input instead of reusing it with only a warning', () => {
+    const { root } = fixture();
+    expect(prepareContext([root]).mode).toBe('graph');
+    writeFileSync(join(root, 'orders.ts'), 'export const orders = 2;\n');
+    expect(prepareContext([root]).mode).toBe('scan');
+    expect(prepareContext([root, '--full']).mode).toBe('scan');
+  });
 
-describe("graph-consuming skills", () => {
-  it.each(graphConsumerSkills)(
-    "%s checks committed and working-tree freshness before using a graph",
-    (skillName) => {
-      const skillPath = resolve(
-        repoRoot,
-        "understand-anything-plugin",
-        "skills",
-        skillName,
-        "SKILL.md",
-      );
-      const content = readFileSync(skillPath, "utf-8");
-
-      for (const instruction of requiredFreshnessInstructions) {
-        expect(content).toContain(instruction);
-      }
-      expect(content).not.toContain(
-        'git diff --name-only "$GRAPH_COMMIT_RAW" HEAD -- .',
-      );
-    },
-  );
-
-  it("understand-domain applies the preflight only to its existing-graph path", () => {
-    const content = readFileSync(
-      resolve(
-        repoRoot,
-        "understand-anything-plugin",
-        "skills",
-        "understand-domain",
-        "SKILL.md",
-      ),
-      "utf-8",
-    );
-
-    expect(content).toContain("When `--full` is used, skip this preflight");
-    expect(content).toContain("Phase 3: Derive from Existing Graph");
+  it('viewing and diffing preserve warnings and actual untracked changes', () => {
+    const { root } = fixture();
+    writeFileSync(join(root, 'new service.ts'), 'export const pending = true;\n');
+    expect(dashboardContext(root).warnings.join('\n')).toMatch(/uncommitted changes/);
+    const diff = collectContext({ sourceRoot: root });
+    expect(diff.changeSources.untracked).toEqual(['new service.ts']);
+    expect(diff.unmappedFiles).toEqual(['new service.ts']);
+    expect(diff.warnings.join('\n')).toMatch(/changed source files/);
   });
 });

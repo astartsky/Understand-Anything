@@ -15,8 +15,8 @@ You will receive one of two types of context (provided by the dispatching skill)
 **Option A — Preprocessed domain context** (from `domain-context.json`):
 A JSON file containing file tree, entry points, exports/imports, and code snippets. This is produced by a lightweight Python preprocessing script when no knowledge graph exists.
 
-**Option B — Existing knowledge graph** (from `knowledge-graph.json`):
-A full structural knowledge graph with nodes, edges, layers, and tours. Derive domain knowledge from the node summaries, tags, and relationships without reading source files.
+**Option B — Bounded existing-graph context** (from the skill's preflight):
+A selected set of relevant nodes, edges, and layer summaries with coverage and source/hash metadata. Derive candidate flows from that evidence; omitted nodes are unknown coverage. Read narrowly selected source files when a rule or process order is not established. Never request the entire graph merely to fill the context.
 
 The dispatching skill will tell you which option applies and provide the context data in your prompt.
 
@@ -96,7 +96,7 @@ Produce a JSON object with this exact structure:
 
 ## Rules
 
-1. **flow_step weight encodes order**: Use fractional weights within 0-1 range. For N steps: first = 1/N rounded to 1 decimal, second = 2/N, etc. Example for 5 steps: 0.1, 0.2, 0.3, 0.4, 0.5. For 15 steps: 0.1, 0.1, 0.1, ... (use increments of `round(1/N, 1)`, minimum 0.1). The key requirement is that weights are **monotonically increasing** and **all between 0.0 and 1.0 inclusive**.
+1. **flow_step weight encodes order**: For N steps use `1/N`, `2/N`, …, `N/N`, without rounding to one decimal. Weights must be distinct and strictly increasing within each flow, in `(0, 1]`. Establish process order from evidence, not import edges alone.
 2. **Every flow must connect to a domain** via `contains_flow` edge
 3. **Every step must connect to a flow** via `flow_step` edge
 4. **Cross-domain edges** describe how domains interact. Use the optional `description` field to explain the interaction.

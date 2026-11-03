@@ -403,6 +403,11 @@ const KnowledgeMetaSchema = z.object({
   backlinks: z.array(z.string()).optional(),
   category: z.string().optional(),
   content: z.string().optional(),
+  extraction: z.string().optional(),
+  provenance: z.array(z.object({
+    articleId: z.string().min(1),
+    quote: z.string().min(1),
+  })).optional(),
 }).passthrough();
 
 const FigmaMetaSchema = z.object({
@@ -446,6 +451,7 @@ export const GraphEdgeSchema = z.object({
   direction: z.enum(["forward", "backward", "bidirectional"]),
   description: z.string().optional(),
   weight: z.number().min(0).max(1),
+  knowledgeMeta: KnowledgeMetaSchema.optional(),
 });
 
 export const LayerSchema = z.object({
@@ -470,6 +476,10 @@ export const ProjectMetaSchema = z.object({
   description: z.string(),
   analyzedAt: z.string(),
   gitCommitHash: z.string(),
+  // Preserve the analysis boundary through validation and dashboard export.
+  sourceRoot: z.string().optional(),
+  workingTreeDirty: z.boolean().optional(),
+  scanId: z.string().optional(),
 });
 
 export const KnowledgeGraphSchema = z.object({

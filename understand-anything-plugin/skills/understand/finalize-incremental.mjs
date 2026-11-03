@@ -13,6 +13,7 @@
  */
 
 import { createRequire } from 'node:module';
+import { assertSourceCommit } from './analysis-context.mjs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
@@ -391,6 +392,8 @@ async function main() {
   if (patch.baseCommit !== plan.baseCommit || patch.headCommit !== plan.headCommit) {
     throw new Error('Fingerprint patch does not match the incremental plan commits');
   }
+
+  assertSourceCommit(projectRoot, plan.headCommit);
 
   if (plan.action === 'FULL_UPDATE') {
     throw new Error('FULL_UPDATE must run the full /understand pipeline');

@@ -20,18 +20,12 @@ const MAX_SOURCE_FILE_BYTES = 1024 * 1024;
 
 // Legacy directory first — projects analyzed before the `.ua` rename keep
 // their existing `.understand-anything/` data.
-const UA_DIR_CANDIDATES = [".understand-anything", ".ua"];
-
 function graphFileCandidates(fileName: string): string[] {
-  const graphDir = process.env.GRAPH_DIR;
-  const roots = [
-    ...(graphDir ? [graphDir] : []),
-    process.cwd(),
-    path.resolve(process.cwd(), "../../.."),
-  ];
-  return roots.flatMap((root) =>
-    UA_DIR_CANDIDATES.map((dir) => path.resolve(root, dir, fileName)),
-  );
+  // GRAPH_DIR selects a project, never a hint for falling back to another checkout.
+  const projectRoot = path.resolve(process.env.GRAPH_DIR ?? process.cwd());
+  const dataDir = fs.existsSync(path.join(projectRoot, ".understand-anything"))
+    ? ".understand-anything" : ".ua";
+  return [path.join(projectRoot, dataDir, fileName)];
 }
 
 function findGraphFile(fileName: string): string | null {
@@ -63,19 +57,22 @@ function normalizeGraphPath(filePath: string, projectRoot: string): string | nul
   return normalized.split(path.sep).join("/");
 }
 
-function graphFilePathSet(graphFile: string, projectRoot: string): Set<string> {
+function graphFilePathSet(graphFiles: string[], projectRoot: string): Set<string> {
   const allowed = new Set<string>();
-  try {
-    const raw = JSON.parse(fs.readFileSync(graphFile, "utf-8")) as {
-      nodes?: Array<Record<string, unknown>>;
-    };
-    for (const node of raw.nodes ?? []) {
-      if (typeof node.filePath !== "string") continue;
-      const normalized = normalizeGraphPath(node.filePath, projectRoot);
-      if (normalized) allowed.add(normalized);
+  for (const graphFile of graphFiles) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(graphFile, "utf-8")) as {
+        nodes?: Array<Record<string, unknown> | null>;
+      };
+      if (!Array.isArray(raw?.nodes)) continue;
+      for (const node of raw.nodes) {
+        if (!node || typeof node.filePath !== "string") continue;
+        const normalized = normalizeGraphPath(node.filePath, projectRoot);
+        if (normalized) allowed.add(normalized);
+      }
+    } catch {
+      // A missing or unreadable graph grants no paths; the other graph is independent.
     }
-  } catch {
-    return allowed;
   }
   return allowed;
 }
@@ -138,12 +135,13 @@ function readSourceFile(url: URL) {
     return rejectFileRequest("Path must stay inside the project");
   }
 
-  const graphFile = findGraphFile("knowledge-graph.json");
-  if (!graphFile) {
-    return rejectFileRequest("No knowledge graph found. Run /understand first.", 404);
+  const graphFiles = ["knowledge-graph.json", "domain-graph.json"]
+    .map(findGraphFile).filter((file): file is string => file !== null);
+  if (graphFiles.length === 0) {
+    return rejectFileRequest("No knowledge or domain graph found. Run /understand or /understand-domain first.", 404);
   }
 
-  const projectRoot = projectRootFromGraphFile(graphFile);
+  const projectRoot = path.resolve(process.env.GRAPH_DIR ?? process.cwd());
   const absoluteFile = path.resolve(projectRoot, normalizedPath);
   const relativeToRoot = path.relative(projectRoot, absoluteFile);
   if (
@@ -155,13 +153,20 @@ function readSourceFile(url: URL) {
     return rejectFileRequest("Path must stay inside the project");
   }
   const safeRelativePath = relativeToRoot.split(path.sep).join("/");
-  if (!graphFilePathSet(graphFile, projectRoot).has(safeRelativePath)) {
-    return rejectFileRequest("File is not in the knowledge graph", 404);
+  if (!graphFilePathSet(graphFiles, projectRoot).has(safeRelativePath)) {
+    return rejectFileRequest("File is not in the selected graphs", 404);
   }
 
   let stat: fs.Stats;
+  let physicalFile: string;
   try {
-    stat = fs.statSync(absoluteFile);
+    physicalFile = fs.realpathSync(absoluteFile);
+    const physicalRoot = fs.realpathSync(projectRoot);
+    const physicalRelative = path.relative(physicalRoot, physicalFile);
+    if (!physicalRelative || physicalRelative === ".." || physicalRelative.startsWith(`..${path.sep}`) || path.isAbsolute(physicalRelative)) {
+      return rejectFileRequest("Path must stay inside the project");
+    }
+    stat = fs.statSync(physicalFile);
   } catch {
     return rejectFileRequest("File not found", 404);
   }
@@ -171,7 +176,7 @@ function readSourceFile(url: URL) {
     return rejectFileRequest("File is too large to preview", 413);
   }
 
-  const buffer = fs.readFileSync(absoluteFile);
+  const buffer = fs.readFileSync(physicalFile);
   if (buffer.includes(0)) return rejectFileRequest("Binary files cannot be previewed", 415);
 
   const content = buffer.toString("utf8");
@@ -189,7 +194,7 @@ function readSourceFile(url: URL) {
 
 export interface DashboardFreshnessReport {
   graphs: {
-    knowledge: GraphFreshnessResult;
+    knowledge?: GraphFreshnessResult;
     domain?: GraphFreshnessResult;
   };
 }
@@ -214,36 +219,20 @@ function readGraphMetadata(graphFile: string): GraphFreshnessInput {
 }
 
 export async function readGraphFreshness() {
-  const graphFile = findGraphFile("knowledge-graph.json");
-  if (!graphFile) {
-    return rejectFileRequest("No knowledge graph found. Run /understand first.", 404);
-  }
-
-  const domainGraphFile = path.join(path.dirname(graphFile), "domain-graph.json");
-  let knowledgeInput: GraphFreshnessInput;
-  let domainInput: GraphFreshnessInput | undefined;
+  const inputs: Record<string, GraphFreshnessInput> = {};
   try {
-    knowledgeInput = readGraphMetadata(graphFile);
-    domainInput = fs.existsSync(domainGraphFile)
-      ? readGraphMetadata(domainGraphFile)
-      : undefined;
+    for (const [name, file] of [["knowledge", "knowledge-graph.json"], ["domain", "domain-graph.json"]]) {
+      const graphFile = findGraphFile(file);
+      if (graphFile) inputs[name] = readGraphMetadata(graphFile);
+    }
   } catch {
     return rejectFileRequest("Failed to read graph file", 500);
   }
-
-  const projectRoot = projectRootFromGraphFile(graphFile);
-  let graphs: DashboardFreshnessReport["graphs"];
-  if (domainInput) {
-    graphs = await getGraphFreshnessBatch(projectRoot, {
-      knowledge: knowledgeInput,
-      domain: domainInput,
-    });
-  } else {
-    const result = await getGraphFreshnessBatch(projectRoot, {
-      knowledge: knowledgeInput,
-    });
-    graphs = { knowledge: result.knowledge };
+  if (Object.keys(inputs).length === 0) {
+    return rejectFileRequest("No knowledge or domain graph found. Run /understand or /understand-domain first.", 404);
   }
+  const projectRoot = path.resolve(process.env.GRAPH_DIR ?? process.cwd());
+  const graphs: DashboardFreshnessReport["graphs"] = await getGraphFreshnessBatch(projectRoot, inputs);
 
   return {
     statusCode: 200,
@@ -425,10 +414,25 @@ const config: DashboardViteConfig = {
             // We convert those to relative paths (src/auth.ts) so the developer's
             // home directory and company directory layout are not leaked.
             try {
-              const raw = JSON.parse(fs.readFileSync(candidate, "utf-8")) as {
+              const bytes = fs.readFileSync(candidate);
+              const raw = JSON.parse(bytes.toString("utf8")) as {
                 nodes?: Array<Record<string, unknown>>;
                 [key: string]: unknown;
               };
+
+              res.setHeader("Cache-Control", "no-store");
+              if (fileName === "knowledge-graph.json") {
+                res.setHeader("X-Understand-Graph-Hash", crypto.createHash("sha256").update(bytes).digest("hex"));
+              }
+              if (fileName === "diff-overlay.json") {
+                const graphFile = findGraphFile("knowledge-graph.json");
+                const graphHash = graphFile
+                  ? crypto.createHash("sha256").update(fs.readFileSync(graphFile)).digest("hex") : null;
+                if (!graphHash || raw.graphContentHash !== graphHash) {
+                  sendJson(res, 409, { error: "Diff snapshot does not match the served knowledge graph. Regenerate /understand-diff." });
+                  return;
+                }
+              }
 
               // Derive the project root from the candidate path so we can
               // make file paths relative to it.

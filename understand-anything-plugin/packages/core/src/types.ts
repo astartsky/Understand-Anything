@@ -26,6 +26,8 @@ export interface KnowledgeMeta {
   backlinks?: string[];
   category?: string;
   content?: string;
+  extraction?: string;
+  provenance?: Array<{ articleId: string; quote: string }>;
 }
 
 // Optional domain metadata for domain/flow/step nodes
@@ -74,6 +76,7 @@ export interface GraphEdge {
   direction: "forward" | "backward" | "bidirectional";
   description?: string;
   weight: number; // 0-1
+  knowledgeMeta?: KnowledgeMeta;
 }
 
 // Layer (logical grouping)
@@ -101,6 +104,9 @@ export interface ProjectMeta {
   description: string;
   analyzedAt: string;
   gitCommitHash: string;
+  sourceRoot?: string;
+  workingTreeDirty?: boolean;
+  scanId?: string;
 }
 
 // Root KnowledgeGraph

@@ -4,10 +4,12 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const skill = readFileSync(
-  resolve(__dirname, '../../../understand-anything-plugin/skills/understand/SKILL.md'),
-  'utf-8',
-);
+const skillDir = resolve(__dirname, '../../../understand-anything-plugin/skills/understand');
+const entrypoint = readFileSync(resolve(skillDir, 'SKILL.md'), 'utf-8');
+// Phase contracts live in references linked by the entrypoint; keep checking
+// the complete procedure rather than forcing it back into one large prompt.
+const references = [...new Set([...entrypoint.matchAll(/\]\((references\/[^)]+\.md)\)/g)].map(match => match[1]))];
+const skill = [entrypoint, ...references.map(file => readFileSync(resolve(skillDir, file), 'utf-8'))].join('\n');
 const hook = readFileSync(
   resolve(__dirname, '../../../understand-anything-plugin/hooks/auto-update-prompt.md'),
   'utf-8',

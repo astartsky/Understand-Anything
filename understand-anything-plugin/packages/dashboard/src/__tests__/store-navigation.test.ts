@@ -107,3 +107,20 @@ describe("store layer navigation container cache resets", () => {
     expectContainerStateCleared();
   });
 });
+
+
+describe("domain-only loading", () => {
+  it("selects the domain view without synthesizing a code graph", () => {
+    const domain = graph();
+    useDashboardStore.getState().setDomainGraph(domain);
+    expect(useDashboardStore.getState().domainGraph).toBe(domain);
+    expect(useDashboardStore.getState().viewMode).toBe("domain");
+    expect(useDashboardStore.getState().graph).toBeNull();
+  });
+
+  it("keeps the structural view when both graphs exist", () => {
+    useDashboardStore.getState().setGraph(graph());
+    useDashboardStore.getState().setDomainGraph(graph());
+    expect(useDashboardStore.getState().viewMode).toBe("structural");
+  });
+});

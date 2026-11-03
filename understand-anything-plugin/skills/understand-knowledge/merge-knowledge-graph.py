@@ -17,37 +17,42 @@ Output:
     already exists).
 """
 
+import argparse
 import json
-import os
+import runpy
 import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-def resolve_ua_dir(root: Path) -> Path:
-    """Mirror core resolveUaDir: legacy .understand-anything/ wins if present."""
-    legacy = root / ".understand-anything"
-    return legacy if legacy.is_dir() else root / ".ua"
+# Load the sibling scanner without an installed package or bytecode cache.
+_scan = runpy.run_path(str(Path(__file__).with_name("parse-knowledge-base.py")))
+resolve_ua_dir = _scan["resolve_ua_dir"]
+_find_markdown_case_insensitive = _scan["find_markdown_case_insensitive"]
+source_snapshot = _scan["source_snapshot"]
+source_state = _scan["source_state"]
+atomic_json = _scan["atomic_json"]
 
 
-def _find_markdown_case_insensitive(parent: Path, name: str) -> Path:
-    """Resolve a known markdown filename case-insensitively within one directory.
+def valid_provenance(value, base_nodes):
+    """Evidence must point to an inventoried article and quote its supplied text.
 
-    Mirrors find_markdown_case_insensitive in parse-knowledge-base.py (the
-    scripts are standalone, so the helper is duplicated): an exact match
-    always wins; otherwise the first case-insensitive sibling is returned.
+    This verifies attribution, not the truth of a claim or the content of raw PDFs.
     """
-    candidate = parent / name
-    if candidate.is_file():
-        return candidate
-    if not parent.is_dir():
-        return candidate
-    wanted = name.lower()
-    for child in sorted(parent.iterdir()):
-        if child.is_file() and child.name.lower() == wanted:
-            return child
-    return candidate
+    if not isinstance(value, list) or not value:
+        return False
+    for item in value:
+        if not isinstance(item, dict):
+            return False
+        if not isinstance(item.get("articleId"), str):
+            return False
+        article = base_nodes.get(item["articleId"], {})
+        quote = item.get("quote")
+        if (article.get("type") != "article" or not isinstance(quote, str)
+                or not quote.strip() or quote not in article.get("knowledgeMeta", {}).get("content", "")):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -117,10 +122,13 @@ def normalize_entity_name(name: str) -> str:
 # Merge pipeline
 # ---------------------------------------------------------------------------
 
-def merge(root: Path) -> dict:
+def merge(root: Path, save=False) -> dict:
+    root = root.resolve()
     intermediate = resolve_ua_dir(root) / "intermediate"
     manifest_path = intermediate / "scan-manifest.json"
 
+    if manifest_path.is_symlink():
+        raise ValueError(f"Refusing symlink scan manifest: {manifest_path}")
     if not manifest_path.is_file():
         print(f"Error: {manifest_path} not found. Run parse-knowledge-base.py first.",
               file=sys.stderr)
@@ -128,7 +136,15 @@ def merge(root: Path) -> dict:
 
     # Load scan manifest (deterministic base)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("sourceRoot") != str(root) or not manifest.get("scanId"):
+        raise ValueError("Unbound scan manifest; rerun the parser for the selected source root")
+    if source_snapshot(root) != manifest.get("inputFiles"):
+        raise ValueError("Source changed since scan; rerun the parser and analysis")
+    state = source_state(root, manifest["inputFiles"])
+    if state["gitCommitHash"] != manifest.get("gitCommitHash"):
+        raise ValueError("Source HEAD changed since scan; rerun the parser and analysis")
     nodes = {n["id"]: n for n in manifest["nodes"]}
+    base_nodes = dict(nodes)
     edges = list(manifest["edges"])
 
     report = {"base_nodes": len(nodes), "base_edges": len(edges),
@@ -140,76 +156,115 @@ def merge(root: Path) -> dict:
     entity_name_map: dict[str, str] = {}  # normalized_name → entity_id
     dedup_remap: dict[str, str] = {}  # duplicate_id → canonical_id
 
+    pending_edges = []
     for bf in batch_files:
-        report["batches"] += 1
+        if bf.is_symlink():
+            print(f"[merge] Warning: Skipping symlink batch {bf.name}", file=sys.stderr)
+            continue
         try:
             batch = json.loads(bf.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"[merge] Warning: Failed to load {bf.name}: {e}", file=sys.stderr)
-            continue
-
-        # Process new nodes from LLM analysis
-        for node in batch.get("nodes", []):
-            node_type = normalize_node_type(node.get("type", ""))
-            if node_type not in VALID_NODE_TYPES:
-                print(f"[merge] Warning: Unknown node type '{node.get('type')}' — skipping",
-                      file=sys.stderr)
+            if not isinstance(batch, dict) or batch.get("scanId") != manifest["scanId"]:
+                print(f"[merge] Warning: Skipping stale/unbound batch {bf.name}", file=sys.stderr)
                 continue
-
+            if not isinstance(batch.get("nodes", []), list) or not isinstance(batch.get("edges", []), list):
+                raise ValueError("nodes and edges must be arrays")
+        except (json.JSONDecodeError, OSError, ValueError) as error:
+            print(f"[merge] Warning: Failed to load {bf.name}: {error}", file=sys.stderr)
+            continue
+        report["batches"] += 1
+        for node in batch.get("nodes", []):
+            if not isinstance(node, dict) or not isinstance(node.get("type"), str):
+                continue
+            node_type = normalize_node_type(node["type"])
+            node_id = node.get("id")
+            # Analysis may add inferred nodes, never replace the deterministic inventory.
+            if (node_type not in ("entity", "claim") or not isinstance(node_id, str)
+                    or not node_id.startswith(node_type + ":") or not node_id.split(":", 1)[1]
+                    or node_id in base_nodes
+                    or (node_type == "claim" and node_id in nodes)
+                    or not isinstance(node.get("name"), str) or not node["name"].strip()
+                    or not isinstance(node.get("summary", node.get("name")), str)
+                    or not isinstance(node.get("tags", []), list)
+                    or not all(isinstance(tag, str) for tag in node.get("tags", []))
+                    or node.get("complexity", "simple") not in ("simple", "moderate", "complex")):
+                print(f"[merge] Warning: Invalid or colliding analysis node {node_id!r}", file=sys.stderr)
+                continue
+            meta = node.get("knowledgeMeta", {})
+            if not isinstance(meta, dict) or not valid_provenance(meta.get("provenance"), base_nodes):
+                print(f"[merge] Warning: Missing/invalid article evidence for {node_id}", file=sys.stderr)
+                continue
+            if node_id in nodes and normalize_entity_name(node["name"]) != normalize_entity_name(nodes[node_id]["name"]):
+                print(f"[merge] Warning: Conflicting entity ID {node_id}", file=sys.stderr)
+                continue
             node["type"] = node_type
-            node_id = node.get("id", "")
-
-            # Entity deduplication — track remapping for edge fixup
             if node_type == "entity":
-                norm_name = normalize_entity_name(node.get("name", ""))
+                norm_name = normalize_entity_name(node["name"])
                 if norm_name in entity_name_map:
-                    # Map duplicate ID → canonical ID for edge remapping
-                    dedup_remap[node_id] = entity_name_map[norm_name]
+                    canonical_id = entity_name_map[norm_name]
+                    dedup_remap[node_id] = canonical_id
+                    evidence = nodes[canonical_id]["knowledgeMeta"]["provenance"]
+                    evidence.extend(item for item in meta["provenance"] if item not in evidence)
                     report["deduped_entities"] += 1
                     continue
                 entity_name_map[norm_name] = node_id
                 report["new_entities"] += 1
-            elif node_type == "claim":
+            else:
                 report["new_claims"] += 1
-
-            # Ensure required fields
-            node.setdefault("summary", node.get("name", ""))
+            node.setdefault("summary", node["name"])
             node.setdefault("tags", [])
             node.setdefault("complexity", "simple")
-
+            meta["extraction"] = "llm-inference"
+            node["knowledgeMeta"] = meta
             nodes[node_id] = node
+        pending_edges.extend(batch.get("edges", []))
 
-        # Process new edges from LLM analysis
-        for edge in batch.get("edges", []):
-            edge_type = normalize_edge_type(edge.get("type", ""))
-            if edge_type not in VALID_EDGE_TYPES:
-                print(f"[merge] Warning: Unknown edge type '{edge.get('type')}' — "
-                      f"mapped to 'related'", file=sys.stderr)
-                edge_type = "related"
+    # Resolve after all batches: a forward reference must not depend on filename order.
+    for edge in pending_edges:
+        if not isinstance(edge, dict) or not isinstance(edge.get("type"), str):
+            report["dropped_edges"] += 1
+            continue
+        meta = edge.get("knowledgeMeta", {})
+        if not isinstance(meta, dict) or not valid_provenance(meta.get("provenance"), base_nodes):
+            report["dropped_edges"] += 1
+            continue
+        edge_type = normalize_edge_type(edge["type"])
+        if edge_type not in VALID_EDGE_TYPES:
+            report["dropped_edges"] += 1
+            continue
+        if (not isinstance(edge.get("source"), str) or not isinstance(edge.get("target"), str)
+                or edge.get("direction", "forward") not in ("forward", "backward", "bidirectional")
+                or not isinstance(edge.get("weight", 0.5), (int, float))
+                or isinstance(edge.get("weight"), bool) or not 0 <= edge.get("weight", 0.5) <= 1):
+            report["dropped_edges"] += 1
+            continue
+        src = dedup_remap.get(edge.get("source", ""), edge.get("source", ""))
+        tgt = dedup_remap.get(edge.get("target", ""), edge.get("target", ""))
+        if src not in nodes or tgt not in nodes:
+            report["dropped_edges"] += 1
+            continue
+        edge.update(source=src, target=tgt, type=edge_type)
+        edge.setdefault("direction", "forward")
+        edge.setdefault("weight", 0.5)
+        meta["extraction"] = "llm-inference"
+        evidence_text = "; ".join(f"{item['articleId']}: {item['quote']}" for item in meta["provenance"])
+        edge["description"] = f"{edge.get('description', '')} [Article evidence: {evidence_text}]".strip()
+        edges.append(edge)
+        report["new_edges"] += 1
 
-            edge["type"] = edge_type
-            edge.setdefault("direction", "forward")
-            edge.setdefault("weight", 0.5)
-
-            # Remap deduped entity IDs, then validate source/target exist
-            src = dedup_remap.get(edge.get("source", ""), edge.get("source", ""))
-            tgt = dedup_remap.get(edge.get("target", ""), edge.get("target", ""))
-            edge["source"] = src
-            edge["target"] = tgt
-            if src in nodes and tgt in nodes:
-                edges.append(edge)
-                report["new_edges"] += 1
-            else:
-                report["dropped_edges"] += 1
-
-    # --- Deduplicate edges ---
-    seen: set[tuple[str, str, str]] = set()
-    final_edges = []
+    # Deduplicate relationships while retaining each article's attribution.
+    by_edge = {}
     for edge in edges:
         key = (edge["source"], edge["target"], edge["type"])
-        if key not in seen:
-            seen.add(key)
-            final_edges.append(edge)
+        if key not in by_edge:
+            by_edge[key] = edge
+            continue
+        evidence = edge.get("knowledgeMeta", {}).get("provenance", [])
+        if evidence:
+            kept = by_edge[key].setdefault("knowledgeMeta", {}).setdefault("provenance", [])
+            kept.extend(item for item in evidence if item not in kept)
+            by_edge[key]["description"] = "Article evidence: " + "; ".join(
+                f"{item['articleId']}: {item['quote']}" for item in kept)
+    final_edges = list(by_edge.values())
 
     # --- Build article→layer map from categories ---
     categories = manifest.get("categories", [])
@@ -229,78 +284,14 @@ def merge(root: Path) -> dict:
         for mid in members:
             article_layer_map[mid] = layer_id
 
-    # --- Assign entity/claim nodes to their parent article's layer ---
-    # Step 1: Build entity/claim → article mapping from edges
-    child_to_article: dict[str, str] = {}
-    for edge in final_edges:
-        src_type = nodes.get(edge["source"], {}).get("type", "")
-        tgt_type = nodes.get(edge["target"], {}).get("type", "")
-        # If an article connects to an entity/claim, map the child to the article
-        if src_type == "article" and tgt_type in ("entity", "claim"):
-            child_to_article.setdefault(edge["target"], edge["source"])
-        elif tgt_type == "article" and src_type in ("entity", "claim"):
-            child_to_article.setdefault(edge["source"], edge["target"])
-
-    # Step 2: For orphan entities/claims, try to match by ID prefix
-    # Build a reverse lookup: bare article name → full article ID
-    # e.g., "concept-aaak-compression" → "article:concepts/concept-aaak-compression"
-    bare_to_article: dict[str, str] = {}
-    for nid in nodes:
-        if nid.startswith("article:"):
-            # Extract the bare filename from paths like "article:concepts/concept-foo"
-            bare = nid.split("/")[-1] if "/" in nid else nid.replace("article:", "")
-            bare_to_article[bare] = nid
-
-    for nid, node in nodes.items():
-        if node["type"] in ("entity", "claim") and nid not in child_to_article:
-            # e.g., "claim:concept-aaak-compression:not-zero-loss" → stem "concept-aaak-compression"
-            # e.g., "entity:brain" → stem "brain"
-            raw = nid.split(":", 1)[1] if ":" in nid else nid  # "concept-aaak-compression:not-zero-loss"
-            stem = raw.split(":")[0]  # "concept-aaak-compression"
-
-            # Try exact bare name match first
-            if stem in bare_to_article:
-                child_to_article[nid] = bare_to_article[stem]
-            else:
-                # Try suffix/substring match against bare names
-                # e.g., entity:brain → segment-brain, entity:mempalace → tool-mempalace
-                matched = False
-                for bare, aid in bare_to_article.items():
-                    if stem in bare or bare in stem:
-                        child_to_article[nid] = aid
-                        matched = True
-                        break
-                    # Also try: bare ends with -stem (e.g., "segment-brain" ends with "-brain")
-                    if bare.endswith(f"-{stem}") or bare.endswith(f"/{stem}"):
-                        child_to_article[nid] = aid
-                        matched = True
-                        break
-                # Last resort: check if the node's name appears in any article's
-                # name OR content (knowledgeMeta.content)
-                if not matched and node.get("name"):
-                    node_name_lower = node["name"].lower()
-                    for aid, anode in nodes.items():
-                        if not aid.startswith("article:"):
-                            continue
-                        # Match against article name
-                        if node_name_lower in anode.get("name", "").lower():
-                            child_to_article[nid] = aid
-                            matched = True
-                            break
-                        # Match against article content (wikilinks or text)
-                        meta = anode.get("knowledgeMeta", {})
-                        content = (meta.get("content") or "").lower()
-                        if len(node_name_lower) >= 3 and node_name_lower in content:
-                            child_to_article[nid] = aid
-                            matched = True
-                            break
-
-    # Step 3: Place children into their parent article's layer
-    for child_id, article_id in child_to_article.items():
-        layer_id = article_layer_map.get(article_id)
-        if layer_id and layer_id in layer_members:
-            layer_members[layer_id].append(child_id)
-            article_layer_map[child_id] = layer_id
+    # Layer placement follows verified provenance, never filename/name guessing.
+    for node_id, node in nodes.items():
+        if node["type"] not in ("entity", "claim"):
+            continue
+        for item in node.get("knowledgeMeta", {}).get("provenance", []):
+            layer_id = article_layer_map.get(item["articleId"])
+            if layer_id in layer_members:
+                layer_members[layer_id].append(node_id)
 
     # --- Build layers ---
     layers = []
@@ -370,7 +361,10 @@ def merge(root: Path) -> dict:
             "frameworks": ["karpathy-wiki"],
             "description": f"Knowledge graph for {project_name}",
             "analyzedAt": datetime.now(timezone.utc).isoformat(),
-            "gitCommitHash": "",
+            "gitCommitHash": manifest["gitCommitHash"],
+            "sourceRoot": str(root),
+            "workingTreeDirty": bool(manifest["workingTreeDirty"] or state["workingTreeDirty"]),
+            "scanId": manifest["scanId"],
         },
         "nodes": list(nodes.values()),
         "edges": final_edges,
@@ -378,21 +372,16 @@ def merge(root: Path) -> dict:
         "tour": tour,
     }
 
-    # Try to get git commit hash
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, cwd=str(root), timeout=5
-        )
-        if result.returncode == 0:
-            graph["project"]["gitCommitHash"] = result.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-
-    # Write output
+    # Recheck immediately before publication; intermediate files and originals remain.
+    final_state = source_state(root, manifest["inputFiles"])
+    if (source_snapshot(root) != manifest["inputFiles"]
+            or final_state["gitCommitHash"] != manifest["gitCommitHash"]):
+        raise ValueError("Source changed during merge; rerun the scan and analysis")
+    graph["project"]["workingTreeDirty"] |= final_state["workingTreeDirty"]
     out_path = intermediate / "assembled-graph.json"
-    out_path.write_text(json.dumps(graph, indent=2), encoding="utf-8")
+    atomic_json(out_path, graph)
+    if save:
+        save_graph(root, graph)
 
     # Report
     print(f"[merge] Input: {report['base_nodes']} scan nodes, "
@@ -409,18 +398,42 @@ def merge(root: Path) -> dict:
     return graph
 
 
+def save_graph(root, graph):
+    ids = {node["id"] for node in graph["nodes"]}
+    if len(ids) != len(graph["nodes"]):
+        raise ValueError("Duplicate graph node IDs")
+    for node in graph["nodes"]:
+        if (not all(field in node for field in ("id", "type", "name", "summary", "tags", "complexity"))
+                or not isinstance(node["tags"], list) or node["complexity"] not in ("simple", "moderate", "complex")):
+            raise ValueError(f"Invalid graph node: {node.get('id')}")
+    for edge in graph["edges"]:
+        if edge["source"] not in ids or edge["target"] not in ids:
+            raise ValueError("Dangling graph edge")
+    ua_dir = resolve_ua_dir(root)
+    meta = {key: graph["project"][key] for key in ("sourceRoot", "gitCommitHash", "workingTreeDirty", "scanId")}
+    meta.update(lastAnalyzedAt=graph["project"]["analyzedAt"], version="1.0.0",
+                analyzedFiles=sum(node["type"] == "article" for node in graph["nodes"]))
+    # Preflight both destinations before replacing either.
+    for name in ("knowledge-graph.json", "meta.json"):
+        path = ua_dir / name
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ValueError(f"Invalid generated output path: {path}")
+    atomic_json(ua_dir / "knowledge-graph.json", graph)
+    atomic_json(ua_dir / "meta.json", meta)
+
+
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: merge-knowledge-graph.py <wiki-directory>", file=sys.stderr)
-        sys.exit(1)
-
-    root = Path(sys.argv[1]).resolve()
+    cli = argparse.ArgumentParser(description=__doc__)
+    cli.add_argument("wiki_directory", type=Path)
+    cli.add_argument("--save", action="store_true", help="Validate and save graph + metadata; retain intermediates")
+    args = cli.parse_args()
+    root = args.wiki_directory.resolve()
     if not root.is_dir():
-        print(f"Error: {root} is not a directory", file=sys.stderr)
-        sys.exit(1)
-
-    merge(root)
-
+        cli.error(f"Not a directory: {root}")
+    try:
+        merge(root, save=args.save)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        cli.exit(1, f"[merge] {error}\n")
 
 if __name__ == "__main__":
     main()

@@ -49,7 +49,7 @@ export type GraphFreshnessResult =
 
 export interface DashboardFreshnessReport {
   graphs: {
-    knowledge: GraphFreshnessResult;
+    knowledge?: GraphFreshnessResult;
     domain?: GraphFreshnessResult;
   };
 }
@@ -150,11 +150,9 @@ export function isDashboardFreshnessReport(
   value: unknown,
 ): value is DashboardFreshnessReport {
   if (!isRecord(value) || !isRecord(value.graphs)) return false;
-  if (!isGraphFreshnessResult(value.graphs.knowledge)) return false;
-  return (
-    !("domain" in value.graphs) ||
-    isGraphFreshnessResult(value.graphs.domain)
-  );
+  const graphs = value.graphs;
+  const names = ["knowledge", "domain"].filter((name) => name in graphs);
+  return names.length > 0 && names.every((name) => isGraphFreshnessResult(graphs[name]));
 }
 
 export function shouldRequestFreshness(

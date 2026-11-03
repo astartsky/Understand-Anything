@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { buildFreshnessBanner } from "../components/StalenessBanner";
 import {
   isDashboardFreshnessReport,
   requestFreshnessReport,
@@ -46,6 +47,10 @@ afterEach(() => {
 });
 
 describe("isDashboardFreshnessReport", () => {
+  it("accepts a domain-only report", () => {
+    expect(isDashboardFreshnessReport({ graphs: { domain: freshReport.graphs.knowledge } })).toBe(true);
+  });
+
   it("accepts complete fresh, dirty, stale, and unknown graph results", () => {
     expect(isDashboardFreshnessReport(freshReport)).toBe(true);
     expect(
@@ -284,5 +289,14 @@ describe("startFreshnessRefresh", () => {
     expect(initialSignal?.aborted).toBe(true);
     target.dispatchEvent(new Event("focus"));
     expect(load).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+it("renders domain-only freshness warnings without inventing a knowledge result", () => {
+  const report = { graphs: { domain: staleReport.graphs.knowledge } } as DashboardFreshnessReport;
+  expect(buildFreshnessBanner(report)).toMatchObject({
+    title: "Domain graph may be stale",
+    action: expect.stringContaining("/understand-domain"),
   });
 });

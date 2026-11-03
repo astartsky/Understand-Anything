@@ -1,3 +1,4 @@
+import { validateDiffOverlay, type DiffSnapshot } from "./diff-overlay";
 import { create } from "zustand";
 import { SearchEngine } from "@understand-anything/core/search";
 import type { SearchResult } from "@understand-anything/core/search";
@@ -128,6 +129,8 @@ interface DashboardStore {
   persona: Persona;
 
   diffMode: boolean;
+  graphContentHash: string | null;
+  diffSnapshot: DiffSnapshot | null;
   changedNodeIds: Set<string>;
   affectedNodeIds: Set<string>;
 
@@ -155,7 +158,7 @@ interface DashboardStore {
   showFunctionsInClassView: boolean;
   toggleShowFunctionsInClassView: () => void;
 
-  setGraph: (graph: KnowledgeGraph) => void;
+  setGraph: (graph: KnowledgeGraph, contentHash?: string | null) => void;
   selectNode: (nodeId: string | null) => void;
   navigateToNode: (nodeId: string) => void;
   navigateToNodeInLayer: (nodeId: string) => void;
@@ -171,7 +174,7 @@ interface DashboardStore {
   expandCodeViewer: () => void;
   collapseCodeViewer: () => void;
 
-  setDiffOverlay: (changed: string[], affected: string[]) => void;
+  setDiffOverlay: (changed: string[], affected: string[], snapshot: DiffSnapshot) => void;
   toggleDiffMode: () => void;
   clearDiffOverlay: () => void;
 
@@ -311,6 +314,8 @@ export const useDashboardStore = create<DashboardStore>()((set, get) => ({
   persona: "junior",
 
   diffMode: false,
+  graphContentHash: null,
+  diffSnapshot: null,
   changedNodeIds: new Set<string>(),
   affectedNodeIds: new Set<string>(),
 
@@ -363,7 +368,7 @@ export const useDashboardStore = create<DashboardStore>()((set, get) => ({
       pendingFocusContainer: null,
     })),
 
-  setGraph: (graph) => {
+  setGraph: (graph, contentHash = null) => {
     const searchEngine = new SearchEngine(graph.nodes);
     const query = get().searchQuery;
     const searchResults = query.trim() ? searchEngine.search(query) : [];
@@ -373,6 +378,11 @@ export const useDashboardStore = create<DashboardStore>()((set, get) => ({
     const { nodesById, nodeIdToLayerId, nodeIdToLayerIds } = buildGraphIndexes(graph);
     set({
       graph,
+      graphContentHash: contentHash,
+      diffMode: false,
+      diffSnapshot: null,
+      changedNodeIds: new Set<string>(),
+      affectedNodeIds: new Set<string>(),
       nodesById,
       nodeIdToLayerId,
       nodeIdToLayerIds,
@@ -561,18 +571,37 @@ export const useDashboardStore = create<DashboardStore>()((set, get) => ({
   expandCodeViewer: () => set({ codeViewerExpanded: true }),
   collapseCodeViewer: () => set({ codeViewerExpanded: false }),
 
-  setDiffOverlay: (changed, affected) =>
+  setDiffOverlay: (changed, affected, snapshot) => {
+    const state = get();
+    const overlay = validateDiffOverlay(
+      { ...snapshot, changedNodeIds: changed, affectedNodeIds: affected },
+      state.graphContentHash,
+      state.graph?.nodes ?? [],
+    );
+    if (!overlay || (changed.length === 0 && affected.length === 0)) {
+      state.clearDiffOverlay();
+      return;
+    }
     set({
       diffMode: true,
+      diffSnapshot: {
+        graphContentHash: overlay.graphContentHash,
+        sourceRoot: overlay.sourceRoot,
+        headCommitHash: overlay.headCommitHash,
+        workingTreeHash: overlay.workingTreeHash,
+        generatedAt: overlay.generatedAt,
+      },
       changedNodeIds: new Set(changed),
       affectedNodeIds: new Set(affected),
-    }),
+    });
+  },
 
   toggleDiffMode: () => set((state) => ({ diffMode: !state.diffMode })),
 
   clearDiffOverlay: () =>
     set({
       diffMode: false,
+      diffSnapshot: null,
       changedNodeIds: new Set<string>(),
       affectedNodeIds: new Set<string>(),
     }),
@@ -688,7 +717,7 @@ export const useDashboardStore = create<DashboardStore>()((set, get) => ({
   activeDomainId: null,
 
   setDomainGraph: (graph) => {
-    set({ domainGraph: graph });
+    set({ domainGraph: graph, ...(!get().graph ? { viewMode: "domain" as const } : {}) });
   },
 
   setIsKnowledgeGraph: (value) => {

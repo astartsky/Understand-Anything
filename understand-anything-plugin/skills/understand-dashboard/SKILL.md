@@ -1,155 +1,101 @@
 ---
 name: understand-dashboard
-description: Launch the interactive web dashboard to visualize a codebase's knowledge graph
+description: Launch or reopen the interactive Understand Anything dashboard for an existing codebase, knowledge, or domain graph. Not for generating or refreshing graphs, answering code questions, or building a general web dashboard.
 argument-hint: "[project-path]"
 ---
 
 # /understand-dashboard
 
-Start the Understand Anything dashboard to visualize the knowledge graph for the current project.
+Open an existing graph in the local dashboard. Accept `knowledge-graph.json`, `domain-graph.json`, or both. Generating or refreshing a graph belongs to `/understand`, `/understand-domain`, or `/understand-knowledge`.
 
-## Instructions
+## 1. Resolve and inspect the selected project
 
-1. Determine the project directory and data directory:
-   - If `$ARGUMENTS` contains a path, use that as the project directory
-   - Otherwise, use the current working directory
-   - Prefer the legacy `.understand-anything/` data directory when it exists, otherwise use `.ua/`
+Set `SKILL_DIR` to the absolute directory containing this loaded `SKILL.md`, following its symlink. Treat the optional project argument as one literal path, defaulting to the current working directory. Run:
 
-   Use the Bash tool to resolve:
-   ```bash
-   PROJECT_ARG="$ARGUMENTS"
-   if [ -n "$PROJECT_ARG" ]; then
-     PROJECT_DIR=$(cd "$PROJECT_ARG" 2>/dev/null && pwd -P)
-   else
-     PROJECT_DIR=$(pwd -P)
-   fi
+```bash
+node "$SKILL_DIR/dashboard-context.mjs" -- "$PROJECT_ARG"
+```
 
-   if [ -z "$PROJECT_DIR" ] || [ ! -d "$PROJECT_DIR" ]; then
-     echo "Error: Project directory not found: ${PROJECT_ARG:-$PWD}"
-     exit 1
-   fi
+Set `PROJECT_ARG` to the supplied path or `.`. The read-only helper returns `projectRoot`, `uaDir`, graph paths, analysis dates/commits, and warnings. It needs only Node.js and optional Git; it does not load or install the analysis runtime.
 
-   if [ -d "$PROJECT_DIR/.understand-anything" ]; then
-     UA_DIR="$PROJECT_DIR/.understand-anything"
-   else
-     UA_DIR="$PROJECT_DIR/.ua"
-   fi
-   ```
+- Keep the selected checkout as `PROJECT_ROOT`; never redirect to the Git common directory or another worktree.
+- Use the existing `.understand-anything/` directory when present, otherwise `.ua/`. This is one directory choice for all data files, not a per-file fallback.
+- If preflight fails, stop before launching or preparing dependencies. Missing graphs: suggest the appropriate generation command and name the searched directory.
+- Show warnings about missing/mismatched source binding, commit differences, and dirty or unknown analysis state. Viewing may continue, but the graph does not prove current code. Do not refresh, copy, rename, or synthesize a graph to make the viewer start.
 
-2. Check that `$UA_DIR/knowledge-graph.json` exists in the project directory. If not, tell the user:
-   ```
-   No knowledge graph found. Run /understand first to analyze this project.
-   ```
+## 2. Locate the installed dashboard
 
-   Use the Bash tool to check:
-   ```bash
-   if [ ! -f "$UA_DIR/knowledge-graph.json" ]; then
-     echo "No knowledge graph found. Run /understand first to analyze this project."
-     exit 1
-   fi
-   ```
+Use the plugin runtime root supplied by the host, this skill's real parent plugin directory, or a known installation below. Use absolute paths from preflight for `PROJECT_ROOT`. Keep these variables in the same shell as the launch, or set them explicitly in that invocation; tool calls may use separate shells.
 
-3. Find the dashboard code. The dashboard is at `packages/dashboard/` relative to this plugin's root directory. Check these paths in order and use the first that exists:
-   - `${CLAUDE_PLUGIN_ROOT}/packages/dashboard/` (Claude Code runtime root, highest priority)
-   - `~/.understand-anything-plugin/packages/dashboard/` (universal symlink, all installs)
-   - Two levels up from `~/.agents/skills/understand-dashboard` real path (self-relative fallback)
-   - Two levels up from `~/.copilot/skills/understand-dashboard` real path (Copilot personal skills fallback)
-   - Common clone-based install roots:
-     - `~/.codex/understand-anything/understand-anything-plugin/packages/dashboard/`
-     - `~/.opencode/understand-anything/understand-anything-plugin/packages/dashboard/`
-     - `~/.pi/understand-anything/understand-anything-plugin/packages/dashboard/`
-     - `~/understand-anything/understand-anything-plugin/packages/dashboard/`
+```bash
+: "${SKILL_DIR:?Set the loaded skill directory}"
+: "${PROJECT_ROOT:?Use projectRoot from preflight}"
+SKILL_REAL=$(cd "$SKILL_DIR" && pwd -P) || exit 1
+PLUGIN_ROOT=""
+for candidate in \
+  "${CLAUDE_PLUGIN_ROOT:-}" \
+  "$SKILL_REAL/../.." \
+  "$HOME/.understand-anything-plugin" \
+  "$HOME/.codex/understand-anything/understand-anything-plugin" \
+  "$HOME/.opencode/understand-anything/understand-anything-plugin" \
+  "$HOME/.pi/understand-anything/understand-anything-plugin" \
+  "$HOME/understand-anything/understand-anything-plugin"; do
+  if [ -n "$candidate" ] && [ -f "$candidate/packages/dashboard/package.json" ]; then
+    PLUGIN_ROOT=$(cd "$candidate" && pwd -P) || exit 1
+    break
+  fi
+done
+if [ -z "$PLUGIN_ROOT" ]; then
+  echo "Dashboard runtime not found. Use a complete Understand Anything installation."
+  exit 1
+fi
+DASHBOARD_DIR="$PLUGIN_ROOT/packages/dashboard"
+```
 
-   Use the Bash tool to resolve:
-   ```bash
-   SKILL_REAL=$(realpath ~/.agents/skills/understand-dashboard 2>/dev/null || readlink -f ~/.agents/skills/understand-dashboard 2>/dev/null || echo "")
-   SELF_RELATIVE=$([ -n "$SKILL_REAL" ] && cd "$SKILL_REAL/../.." 2>/dev/null && pwd || echo "")
-   COPILOT_SKILL_REAL=$(realpath ~/.copilot/skills/understand-dashboard 2>/dev/null || readlink -f ~/.copilot/skills/understand-dashboard 2>/dev/null || echo "")
-   COPILOT_SELF_RELATIVE=$([ -n "$COPILOT_SKILL_REAL" ] && cd "$COPILOT_SKILL_REAL/../.." 2>/dev/null && pwd || echo "")
+## 3. Start an existing local runtime
 
-   PLUGIN_ROOT=""
-   for candidate in \
-     "${CLAUDE_PLUGIN_ROOT}" \
-     "$HOME/.understand-anything-plugin" \
-     "$SELF_RELATIVE" \
-     "$COPILOT_SELF_RELATIVE" \
-     "$HOME/.codex/understand-anything/understand-anything-plugin" \
-     "$HOME/.opencode/understand-anything/understand-anything-plugin" \
-     "$HOME/.pi/understand-anything/understand-anything-plugin" \
-     "$HOME/understand-anything/understand-anything-plugin"; do
-     if [ -n "$candidate" ] && [ -d "$candidate/packages/dashboard" ]; then
-       PLUGIN_ROOT="$candidate"; break
-     fi
-   done
+Prefer the built standalone viewer: it does not need dependency installation or a core build to read a graph. Otherwise use the installed local Vite executable. Run this in a managed background terminal/session and retain its identity for stopping this process:
 
-   if [ -z "$PLUGIN_ROOT" ]; then
-     echo "Error: Cannot find the understand-anything plugin root."
-     echo "Checked:"
-     echo "  - ${CLAUDE_PLUGIN_ROOT:-<unset CLAUDE_PLUGIN_ROOT>}"
-     echo "  - $HOME/.understand-anything-plugin"
-     echo "  - ${SELF_RELATIVE:-<unresolved path derived from ~/.agents/skills/understand-dashboard>}"
-     echo "  - ${COPILOT_SELF_RELATIVE:-<unresolved path derived from ~/.copilot/skills/understand-dashboard>}"
-     echo "  - $HOME/.codex/understand-anything/understand-anything-plugin"
-     echo "  - $HOME/.opencode/understand-anything/understand-anything-plugin"
-     echo "  - $HOME/.pi/understand-anything/understand-anything-plugin"
-     echo "  - $HOME/understand-anything/understand-anything-plugin"
-     echo "Make sure you followed the installation instructions for your platform."
-     exit 1
-   fi
+```bash
+: "${PROJECT_ROOT:?Use projectRoot from preflight}"
+: "${PLUGIN_ROOT:?Resolve the installed plugin root}"
+DASHBOARD_DIR="$PLUGIN_ROOT/packages/dashboard"
+VIEWER_DIR="$PLUGIN_ROOT/packages/viewer"
+if [ -f "$VIEWER_DIR/bin/viewer.mjs" ] && \
+   [ -f "$VIEWER_DIR/dist/index.html" ] && \
+   [ -f "$VIEWER_DIR/bin/dist/staleness.js" ]; then
+  node "$VIEWER_DIR/bin/viewer.mjs" "$PROJECT_ROOT" --no-open
+else
+  VITE_ENTRY="$DASHBOARD_DIR/node_modules/vite/bin/vite.js"
+  if [ ! -f "$VITE_ENTRY" ] || [ ! -f "$PLUGIN_ROOT/packages/core/dist/schema.js" ]; then
+    echo "Local viewer or dashboard dependencies/build are missing. No installation was run."
+    exit 1
+  fi
+  cd "$DASHBOARD_DIR" || exit 1
+  BROWSER=none GRAPH_DIR="$PROJECT_ROOT" node "$VITE_ENTRY" --host 127.0.0.1
+fi
+```
 
-   DASHBOARD_DIR="$PLUGIN_ROOT/packages/dashboard"
-   ```
+A startup failure is a failure: inspect its output instead of silently downloading executables or changing a lockfile. If setup is authorized under host policy, use the installation's documented pinned setup/build from its verified workspace root; otherwise report the missing prerequisite. Never run an install after a failed `cd`, relax `--frozen-lockfile`, or use a bare `npx vite` that may download a new version. Release viewers must match the installed plugin version; do not silently substitute a downloaded release for local fixes.
 
-4. **Fast path — try the prebuilt viewer first (no install, no build).** Each release ships a self-contained viewer tarball; run it pinned to the installed plugin version:
-   ```bash
-   : "${PLUGIN_ROOT:?Run step 3 first so PLUGIN_ROOT is set}"
-   : "${PROJECT_DIR:?Run step 1 first so PROJECT_DIR is set}"
-   PLUGIN_VERSION=$(node -p "require('$PLUGIN_ROOT/package.json').version")
-   VIEWER_URL="https://github.com/Egonex-AI/Understand-Anything/releases/download/v${PLUGIN_VERSION}/understand-anything-viewer.tgz"
-   npx --yes "$VIEWER_URL" "$PROJECT_DIR"
-   ```
-   Run this in the background. It prints the same `🔑  Dashboard URL` line as the dev server:
-   - If the line appears, **skip steps 5-6** and continue at step 7.
-   - If the process exits without printing it (no release asset for this version, or no network), fall back to steps 5-6.
+## 4. Verify and report the actual URL
 
-5. Fallback: install dependencies and build if needed:
-   ```bash
-   : "${PLUGIN_ROOT:?Run step 3 first so PLUGIN_ROOT is set}"
-   DASHBOARD_DIR="${DASHBOARD_DIR:-$PLUGIN_ROOT/packages/dashboard}"
-   cd "$DASHBOARD_DIR" && (pnpm install --frozen-lockfile 2>/dev/null || pnpm install)
-   ```
-   Then ensure the core package is built (the dashboard depends on it):
-   ```bash
-   : "${PLUGIN_ROOT:?Run step 3 first so PLUGIN_ROOT is set}"
-   cd "$PLUGIN_ROOT" && pnpm --filter @understand-anything/core build
-   ```
+Wait for this process to print:
 
-6. Fallback: start the Vite dev server pointing at the project's knowledge graph:
-   ```bash
-   : "${PROJECT_DIR:?Run step 1 first so PROJECT_DIR is set}"
-   : "${DASHBOARD_DIR:?Run step 5 first so DASHBOARD_DIR is set}"
-   cd "$DASHBOARD_DIR" && GRAPH_DIR="$PROJECT_DIR" npx vite --host 127.0.0.1
-   ```
-   Run this in the background so the user can continue working.
+```text
+🔑  Dashboard URL: http://127.0.0.1:<PORT>/?token=<TOKEN>
+```
 
-7. **Capture the access token URL from the server output.** The server (viewer or Vite) prints a line like:
-   ```
-   🔑  Dashboard URL: http://127.0.0.1:<PORT>?token=<TOKEN>
-   ```
-   Extract the full URL including the `?token=` parameter. The token is required to access the knowledge graph data — without it the dashboard will show an "Access Token Required" gate.
+Use the full printed URL, including the token. Ports can change when busy; never guess the port or token. Verify that an authenticated request for each selected graph returns JSON with the expected project, and that the browser renders the expected view when browser tooling is available. Domain-only data must open the domain view; an HTML page or a listening port alone is not proof. If startup exits or verification fails, report the actual error instead of “started”.
 
-8. Report to the user, including the full tokenized URL:
-   ```
-   Dashboard started at http://127.0.0.1:<PORT>?token=<TOKEN>
-   Viewing: $UA_DIR/knowledge-graph.json
+Open the verified URL using the host's browser tool when available. Report only the URL, selected graph path(s), relevant freshness warnings, and the retained terminal/session stop method. A detached background process has no usable Ctrl+C in the user's current terminal. Stop only the process/session started by this invocation; do not kill servers by name or port.
 
-   The dashboard is running in the background. Press Ctrl+C in the terminal to stop it.
-   ```
-   **Important:** Always include the `?token=` parameter in the URL you share. If you omit it, the user will be blocked by the token gate and have to manually find the token in the terminal output.
+## Diff overlays are dated snapshots
 
-## Notes
+The viewer accepts a diff overlay only when its SHA-256 fingerprint matches the raw served knowledge graph (before path sanitization), and its ID arrays refer to existing graph nodes. Missing/invalid identity, unknown IDs, duplicate/overlapping arrays, changed graphs, empty overlays and token/reload changes clear previous highlighting. A committed-only branch/PR snapshot may reference a head different from the selected checkout; this alone does not invalidate it.
 
-- The fast path (step 4) downloads a version-pinned, self-contained viewer from the GitHub release — nothing is installed into the plugin directory and no build runs
-- The dashboard auto-opens in the default browser (both the viewer and Vite's `--open`)
-- If port 5173 is already in use, the next available port is picked (both paths)
-- In the fallback, the `GRAPH_DIR` environment variable tells the dev server where to find the knowledge graph
+The Diff control labels an accepted snapshot with `generatedAt` and `headCommitHash`. This binds it to the graph and records when it was produced; it does not prove that the current working tree still matches `workingTreeHash`. Regenerate `/understand-diff` to update a snapshot. Legacy overlays lacking fingerprints or snapshot metadata must be regenerated; never call them current.
+
+## Validation after changes
+
+Run `node --test "$SKILL_DIR/dashboard-context.test.mjs"`. Runtime changes also require the affected dashboard tests, viewer end-to-end tests, and a localhost domain-only consumer check. Keep synthetic graph fixtures and logs outside the project being viewed. Distinguish unit/API checks, an actual browser check, and manual routing traces in the result.
